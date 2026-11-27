@@ -1,0 +1,145 @@
+# Copia para el repo PÚBLICO omdigitalar/cyberwax-publicar (C122): ahí los minutos de Actions son gratis e ilimitados.
+# El código sigue privado: este workflow baja cyberwax-admin con el secreto CODIGO_TOKEN (solo lectura).
+# Los logs de un repo público se ven: no imprimir claves ni datos de clientes.
+# Rearma la web beta con el catálogo del Admin y la sube por FTP a beta.cyberwax.com.ar (C42).
+# Corre una vez por noche (la publicación rápida, web-beta-rapido.yml, cubre el día) y solo publica si el catálogo cambió. Los datos del FTP están en los secretos del repo
+# (Settings → Secrets and variables → Actions): FTP_SERVIDOR, FTP_USUARIO, FTP_CLAVE. Sin ellos no hace nada.
+name: Web beta
+
+on:
+  schedule:
+    - cron: "20 6 * * *"
+  workflow_dispatch:
+    inputs:
+      forzar:
+        description: "Publicar aunque el catálogo no haya cambiado"
+        type: boolean
+        default: false
+
+concurrency: web-beta
+
+env:
+  ADMIN: https://admin.cyberwax.com.ar
+  # Lanzamiento (25/11/2026): la web vive en el dominio principal, en public_html (los secretos FTP apuntan ahí)
+  WEB: https://cyberwax.com.ar
+  FTP_SERVIDOR: ${{ secrets.FTP_SERVIDOR }}
+  FTP_USUARIO: ${{ secrets.FTP_USUARIO }}
+  FTP_CLAVE: ${{ secrets.FTP_CLAVE }}
+
+jobs:
+  publicar:
+    runs-on: ubuntu-latest
+    # 45 min: si se corta a mitad de la subida por FTP, la web queda a medio publicar (pasó el 16/11)
+    timeout-minutes: 45
+    steps:
+      - name: Falta configurar el FTP
+        if: env.FTP_SERVIDOR == ''
+        run: echo "::notice::Todavía no se cargaron los datos del FTP en los secretos del repo; no se publica nada."
+
+      # El checkout va primero: si va después, limpia el directorio y borra catalogo.json y agotados.json (falló así desde el 18/11)
+      - uses: actions/checkout@v4
+        if: env.FTP_SERVIDOR != ''
+        with:
+          repository: omdigitalar/cyberwax-admin
+          token: ${{ secrets.CODIGO_TOKEN }}
+          persist-credentials: false
+
+      - name: ¿Cambió el catálogo?
+        if: env.FTP_SERVIDOR != ''
+        id: catalogo
+        run: |
+          # La primera consulta despierta el Admin (el hosting lo duerme sin visitas); al despertar trae de Discogs si toca
+          curl -fsS --max-time 180 -o /dev/null "$ADMIN/api/catalogo" || true
+          sleep 150
+          # A veces el hosting responde una página HTML (Admin arrancando) en vez del JSON: se reintenta (falló así el 27/11)
+          for i in 1 2 3 4 5; do
+            if curl -fsS --max-time 180 "$ADMIN/api/catalogo" -o catalogo.json && jq -e '.productos | type == "array"' catalogo.json > /dev/null 2>&1; then break; fi
+            echo "Intento $i: el Admin no devolvió el catálogo en JSON ($(head -c 80 catalogo.json 2>/dev/null | tr -d '\n')); reintento en 30 s."
+            rm -f catalogo.json; sleep 30
+          done
+          if [ ! -f catalogo.json ]; then echo "::error::El Admin no devolvió el catálogo en JSON tras 5 intentos; no se publica."; exit 1; fi
+          total=$(jq '.productos | length' catalogo.json)
+          # Un catálogo casi vacío es más probable una falla que una venta total: no se publica
+          if [ "$total" -lt 50 ]; then echo "::error::El catálogo vino con $total productos; no se publica."; exit 1; fi
+          # Fichas de discos agotados (C63): si el Admin todavía no las publica, cuenta como lista vacía
+          curl -fsS --max-time 180 "$ADMIN/api/agotados" -o agotados.json || echo '{"agotados":[]}' > agotados.json
+          # Tabla de redirecciones de la web vieja (C63): también publica si cambió
+          curl -fsS --max-time 180 "$ADMIN/api/redirecciones" -o redirecciones.json || echo '{}' > redirecciones.json
+          nuevo=$( (jq -cS '.productos' catalogo.json; jq -cS '.agotados' agotados.json; jq -cS '.' redirecciones.json) | sha256sum | cut -c1-64)
+          viejo=$(curl -fsS --max-time 180 "$WEB/catalogo.sha" || echo ninguno)
+          echo "sha=$nuevo" >> "$GITHUB_OUTPUT"
+          if [ "$nuevo" != "$viejo" ] || [ "${{ inputs.forzar }}" = "true" ]; then
+            echo "publicar=1" >> "$GITHUB_OUTPUT"
+            echo "Catálogo con $total productos; cambió desde la última publicación."
+          else
+            echo "Sin cambios en el catálogo ($total productos): no se publica."
+          fi
+
+      - uses: actions/setup-node@v4
+        if: steps.catalogo.outputs.publicar == '1'
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # Tapas livianas en WebP (C82): se guardan entre corridas para bajar y convertir solo las nuevas
+      - uses: actions/cache@v4
+        if: steps.catalogo.outputs.publicar == '1'
+        with:
+          path: web/public/tapas
+          key: tapas-${{ github.run_id }}
+          restore-keys: tapas-
+
+      - name: Armar la web
+        if: steps.catalogo.outputs.publicar == '1'
+        working-directory: web
+        env:
+          CATALOGO_URL: ${{ env.ADMIN }}/api/catalogo
+          PUBLIC_API_URL: ${{ env.ADMIN }}
+          # Buscador de direcciones del checkout (C92): clave de Google Maps restringida a la web, en Settings → Variables
+          PUBLIC_GOOGLE_MAPS_KEY: ${{ vars.GOOGLE_MAPS_KEY }}
+          SITE_URL: ${{ env.WEB }}
+          # Dominio principal: Google y bots habilitados (C75)
+          PUBLIC_INDEXAR: "1"
+        run: |
+          npm ci
+          # Si falla, la web sale igual con las tapas originales de Discogs
+          node scripts/tapas.mjs || echo "::warning::No se pudieron armar las tapas livianas"
+          npm run build
+          echo "${{ steps.catalogo.outputs.sha }}" > dist/catalogo.sha
+
+      - name: Subir por FTP
+        if: steps.catalogo.outputs.publicar == '1'
+        run: |
+          sudo apt-get install -y -qq lftp > /dev/null
+          # El certificado del FTP suele estar a nombre del servidor del hosting y no de ftp.cyberwax.com.ar. Si es así y
+          # ese nombre apunta a la misma máquina, se conecta con ese nombre: la conexión sigue cifrada y verificada.
+          host="$FTP_SERVIDOR"
+          cn=$(echo | timeout 20 openssl s_client -starttls ftp -connect "$host:21" -servername "$host" 2>/dev/null \
+            | openssl x509 -noout -subject -nameopt multiline 2>/dev/null | sed -n 's/^ *commonName *= *//p' | head -1)
+          ip() { getent ahostsv4 "$1" | awk 'NR==1 {print $1}'; }
+          if [ -n "$cn" ] && [ "$cn" != "$host" ] && [ "${cn#\*}" = "$cn" ] && [ -n "$(ip "$cn")" ] && [ "$(ip "$cn")" = "$(ip "$host")" ]; then
+            echo "El certificado del FTP es de $cn (misma máquina): se usa ese nombre."
+            host="$cn"
+          fi
+          # Publicación incremental (C52): se sube solo lo que cambió de contenido desde la última vez (manifiesto de hashes
+          # publicado en la web) y se borra solo lo que ya no existe. Sin manifiesto, o con "Publicar aunque no haya cambiado",
+          # se sube todo. El manifiesto y la marca del catálogo van al final: si algo falla, la próxima corrida lo retoma.
+          viejo=-
+          if [ "${{ inputs.forzar }}" != "true" ] && curl -fsS "$WEB/manifiesto.txt" -o manifiesto-publicado.txt; then viejo=manifiesto-publicado.txt; fi
+          node scripts/web-resumen.mjs resumen catalogo.json agotados.json > resumen.json
+          scripts/web-incremental.sh web/dist "$viejo" incremental
+          # Borrados: el archivo y, si la carpeta queda vacía, la carpeta; todo se valida antes de armar el comando
+          : > borrados.lftp
+          while IFS= read -r ruta; do
+            [ -n "$ruta" ] || continue
+            case "$ruta" in /*|*..*|*[!A-Za-z0-9._/-]*) echo "::warning::Ruta rara, no se borra: $ruta"; continue;; esac
+            echo "rm -f '$ruta'" >> borrados.lftp
+            carpeta=$(dirname "$ruta")
+            if [ "$carpeta" != "." ]; then echo "rmdir '$carpeta'" >> borrados.lftp; fi
+          done < incremental/borrar.txt
+          # Orden: primero scripts/estilos (_astro) y tapas WebP, después las páginas que las usan. Si la subida se corta,
+          # las páginas viejas siguen andando y las nuevas no quedan con imágenes rotas (pasó el 16/11).
+          # Un solo zip que el hosting descomprime (C118); si no se puede, archivo por archivo como antes
+          scripts/web-subir.sh "$host" incremental/subir borrados.lftp \
+            incremental/nuevo.txt:manifiesto.txt resumen.json:resumen.json web/dist/catalogo.sha:catalogo.sha
