@@ -1,0 +1,128 @@
+# Copia para el repo PÚBLICO omdigitalar/cyberwax-publicar (C122): ahí los minutos de Actions son gratis e ilimitados.
+# El código sigue privado: este workflow baja cyberwax-admin con el secreto CODIGO_TOKEN (solo lectura).
+# Los logs de un repo público se ven: no imprimir claves ni datos de clientes.
+# Publicación rápida de la web beta (C94): cada 30 min mira qué fichas cambiaron (discos nuevos, vendidos, precios) y arma
+# y sube solo esas, más las páginas de listados. No borra nada y no toca catalogo.sha: la corrida completa (web-beta.yml,
+# una vez por noche) rearma todo y deja el resto al día. Si cambiaron demasiadas fichas, dispara la completa.
+name: Web beta rápida
+
+on:
+  schedule:
+    - cron: "10,40 * * * *"
+  workflow_dispatch:
+
+concurrency: web-beta
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  ADMIN: https://admin.cyberwax.com.ar
+  # Lanzamiento (25/11/2026): la web vive en el dominio principal, en public_html (los secretos FTP apuntan ahí)
+  WEB: https://cyberwax.com.ar
+  FTP_SERVIDOR: ${{ secrets.FTP_SERVIDOR }}
+  FTP_USUARIO: ${{ secrets.FTP_USUARIO }}
+  FTP_CLAVE: ${{ secrets.FTP_CLAVE }}
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  rapida:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Falta configurar el FTP
+        if: env.FTP_SERVIDOR == ''
+        run: echo "::notice::Sin datos del FTP en los secretos; no se publica nada."
+
+      - uses: actions/checkout@v4
+        if: env.FTP_SERVIDOR != ''
+        with:
+          repository: omdigitalar/cyberwax-admin
+          token: ${{ secrets.CODIGO_TOKEN }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        if: env.FTP_SERVIDOR != ''
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: ¿Qué fichas cambiaron?
+        if: env.FTP_SERVIDOR != ''
+        id: cambios
+        run: |
+          # Despierta el Admin (el hosting lo duerme sin visitas) y le da tiempo de traer de Discogs
+          curl -fsS --max-time 180 -o /dev/null "$ADMIN/api/catalogo" || true
+          sleep 45
+          # A veces el hosting responde una página HTML (Admin arrancando) en vez del JSON: se reintenta (falló así el 27/11)
+          for i in 1 2 3 4 5; do
+            if curl -fsS --max-time 180 "$ADMIN/api/catalogo" -o catalogo.json && jq -e '.productos | type == "array"' catalogo.json > /dev/null 2>&1; then break; fi
+            echo "Intento $i: el Admin no devolvió el catálogo en JSON ($(head -c 80 catalogo.json 2>/dev/null | tr -d '\n')); reintento en 30 s."
+            rm -f catalogo.json; sleep 30
+          done
+          if [ ! -f catalogo.json ]; then echo "::warning::El Admin no respondió el catálogo; se saltea esta corrida (la próxima reintenta)."; echo "publicar=0" >> "$GITHUB_OUTPUT"; exit 0; fi
+          total=$(jq '.productos | length' catalogo.json)
+          if [ "$total" -lt 50 ]; then echo "::error::El catálogo vino con $total productos; no se publica."; exit 1; fi
+          curl -fsS --max-time 180 "$ADMIN/api/agotados" -o agotados.json || echo '{"agotados":[]}' > agotados.json
+          node scripts/web-resumen.mjs resumen catalogo.json agotados.json > resumen-nuevo.json
+          if ! curl -fsS --max-time 60 "$WEB/resumen.json" -o resumen-publicado.json || ! jq -e 'type == "object"' resumen-publicado.json > /dev/null 2>&1; then
+            echo "::notice::La web todavía no tiene resumen.json: se dispara la publicación completa, que lo crea."
+            gh workflow run web-beta.yml -R "$GITHUB_REPOSITORY" -f forzar=true
+            echo "publicar=0" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          slugs=$(node scripts/web-resumen.mjs cambios resumen-publicado.json resumen-nuevo.json)
+          n=$(echo "$slugs" | tr ',' '\n' | grep -c . || true)
+          if [ "$n" -eq 0 ]; then echo "Sin cambios en las fichas ($total productos)."; echo "publicar=0" >> "$GITHUB_OUTPUT"; exit 0; fi
+          if [ "$n" -gt 60 ]; then
+            echo "::notice::$n fichas cambiadas: se dispara la publicación completa."
+            gh workflow run web-beta.yml -R "$GITHUB_REPOSITORY" -f forzar=false
+            echo "publicar=0" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "$n fichas a publicar: $slugs"
+          echo "publicar=1" >> "$GITHUB_OUTPUT"
+          echo "slugs=$slugs" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v4
+        if: steps.cambios.outputs.publicar == '1'
+        with:
+          path: web/public/tapas
+          key: tapas-${{ github.run_id }}
+          restore-keys: tapas-
+
+      - name: Armar solo lo que cambió
+        if: steps.cambios.outputs.publicar == '1'
+        working-directory: web
+        env:
+          CATALOGO_URL: ${{ env.ADMIN }}/api/catalogo
+          PUBLIC_API_URL: ${{ env.ADMIN }}
+          PUBLIC_GOOGLE_MAPS_KEY: ${{ vars.GOOGLE_MAPS_KEY }}
+          SITE_URL: ${{ env.WEB }}
+          # Dominio principal: Google y bots habilitados (C75)
+          PUBLIC_INDEXAR: "1"
+          SOLO_SLUGS: ${{ steps.cambios.outputs.slugs }}
+        run: |
+          npm ci
+          node scripts/tapas.mjs || echo "::warning::No se pudieron armar las tapas livianas"
+          npm run build
+
+      - name: Subir por FTP (sin borrar nada)
+        if: steps.cambios.outputs.publicar == '1'
+        run: |
+          sudo apt-get install -y -qq lftp > /dev/null
+          host="$FTP_SERVIDOR"
+          cn=$(echo | timeout 20 openssl s_client -starttls ftp -connect "$host:21" -servername "$host" 2>/dev/null \
+            | openssl x509 -noout -subject -nameopt multiline 2>/dev/null | sed -n 's/^ *commonName *= *//p' | head -1)
+          ip() { getent ahostsv4 "$1" | awk 'NR==1 {print $1}'; }
+          if [ -n "$cn" ] && [ "$cn" != "$host" ] && [ "${cn#\*}" = "$cn" ] && [ -n "$(ip "$cn")" ] && [ "$(ip "$cn")" = "$(ip "$host")" ]; then host="$cn"; fi
+          # Sin manifiesto publicado no hay base para comparar: se deja a la publicación completa
+          curl -fsS "$WEB/manifiesto.txt" -o manifiesto-publicado.txt
+          scripts/web-incremental.sh web/dist manifiesto-publicado.txt incremental
+          # Manifiesto nuevo = el publicado con lo recién armado encima (las fichas que no se rearmaron se conservan)
+          grep -E '^[0-9a-f]{64}  [A-Za-z0-9._/-]+$' manifiesto-publicado.txt | LC_ALL=C sort -k2 > m-viejo.txt
+          LC_ALL=C sort -k2 incremental/nuevo.txt > m-nuevo.txt
+          LC_ALL=C join -1 2 -2 2 -v1 m-viejo.txt m-nuevo.txt | awk '{print $2"  "$1}' > m-conservado.txt
+          cat m-conservado.txt incremental/nuevo.txt | LC_ALL=C sort -k2 > manifiesto-final.txt
+          cp resumen-nuevo.json resumen.json
+          scripts/web-subir.sh "$host" incremental/subir - manifiesto-final.txt:manifiesto.txt resumen.json:resumen.json
