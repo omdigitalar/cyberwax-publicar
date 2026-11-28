@@ -57,7 +57,11 @@ jobs:
             echo "Intento $i: el Admin no devolvió el catálogo en JSON ($(head -c 80 catalogo.json 2>/dev/null | tr -d '\n')); reintento en 30 s."
             rm -f catalogo.json; sleep 30
           done
-          if [ ! -f catalogo.json ]; then echo "::error::El Admin no devolvió el catálogo en JSON tras 5 intentos; no se publica."; exit 1; fi
+          if [ ! -f catalogo.json ]; then
+            # Corrida programada: se saltea sin fallar (la rápida y la próxima noche lo retoman). A mano sí avisa con error.
+            if [ "${{ github.event_name }}" = "schedule" ]; then echo "::warning::El Admin no devolvió el catálogo en JSON (¿reiniciando?); se saltea esta corrida."; exit 0; fi
+            echo "::error::El Admin no devolvió el catálogo en JSON tras 5 intentos; no se publica."; exit 1
+          fi
           total=$(jq '.productos | length' catalogo.json)
           # Un catálogo casi vacío es más probable una falla que una venta total: no se publica
           if [ "$total" -lt 50 ]; then echo "::error::El catálogo vino con $total productos; no se publica."; exit 1; fi
